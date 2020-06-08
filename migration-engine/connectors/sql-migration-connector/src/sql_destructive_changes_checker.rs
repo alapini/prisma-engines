@@ -1,14 +1,21 @@
+mod database_check;
+mod destructive_check_plan;
+mod sql_migration_warning;
 mod sql_unexecutable_migration;
 
 use crate::{
     sql_schema_differ::DiffingOptions, AddColumn, AlterColumn, Component, DropColumn, DropTable, DropTables, SqlError,
     SqlMigration, SqlMigrationStep, SqlResult, TableChange,
 };
+use database_check::DatabaseCheck;
+use destructive_check_plan::DestructiveCheckPlan;
 use migration_connector::{
     ConnectorResult, DestructiveChangeDiagnostics, DestructiveChangesChecker, MigrationWarning, UnexecutableMigration,
 };
 use quaint::{ast::*, prelude::SqlFamily};
+use sql_migration_warning::SqlMigrationWarning;
 use sql_schema_describer::{ColumnArity, SqlSchema};
+use sql_unexecutable_migration::SqlUnexecutableMigration;
 
 pub struct SqlDestructiveChangesChecker<'a> {
     pub connector: &'a crate::SqlMigrationConnector,
@@ -21,22 +28,10 @@ impl Component for SqlDestructiveChangesChecker<'_> {
 }
 
 impl SqlDestructiveChangesChecker<'_> {
-    async fn check_table_drop(
-        &self,
-        table_name: &str,
-        diagnostics: &mut DestructiveChangeDiagnostics,
-    ) -> SqlResult<()> {
-        let rows_count = self.count_rows_in_table(table_name).await?;
-
-        if rows_count > 0 {
-            diagnostics.add_warning(MigrationWarning {
-                description: format!(
-                    "You are about to drop the table `{table_name}`, which is not empty ({rows_count} rows).",
-                    table_name = table_name,
-                    rows_count = rows_count
-                ),
-            });
-        }
+    async fn check_table_drop(&self, table_name: &str, diagnostics: &mut DestructiveCheckPlan) -> SqlResult<()> {
+        diagnostics.push_warning(SqlMigrationWarning::NonEmptyTableDrop {
+            table: table_name.to_owned(),
+        });
 
         Ok(())
     }
@@ -91,24 +86,16 @@ impl SqlDestructiveChangesChecker<'_> {
     }
 
     /// Emit a warning when we drop a column that contains non-null values.
-    async fn check_column_drop(
+    fn check_column_drop(
         &self,
         drop_column: &DropColumn,
         table: &sql_schema_describer::Table,
-        diagnostics: &mut DestructiveChangeDiagnostics,
+        diagnostics: &mut DestructiveCheckPlan,
     ) -> SqlResult<()> {
-        let values_count = self.count_values_in_column(&drop_column.name, table).await?;
-
-        if values_count > 0 {
-            diagnostics.add_warning(MigrationWarning {
-                description: format!(
-                    "You are about to drop the column `{column_name}` on the `{table_name}` table, which still contains {values_count} non-null values.",
-                    column_name=drop_column.name,
-                    table_name=&table.name,
-                    values_count=values_count,
-                )
-            })
-        }
+        diagnostics.push_warning(SqlMigrationWarning::NonEmptyColumnDrop {
+            table: table.name.clone(),
+            column: drop_column.name.clone(),
+        });
 
         Ok(())
     }
@@ -118,11 +105,11 @@ impl SqlDestructiveChangesChecker<'_> {
     /// - There are existing rows
     /// - The new column is required
     /// - There is no default value for the new column
-    async fn check_add_column(
+    fn check_add_column(
         &self,
         add_column: &AddColumn,
         table: &sql_schema_describer::Table,
-        diagnostics: &mut DestructiveChangeDiagnostics,
+        diagnostics: &mut DestructiveCheckPlan,
     ) -> SqlResult<()> {
         let column_is_required_without_default =
             add_column.column.tpe.arity.is_required() && add_column.column.default.is_none();
@@ -132,22 +119,17 @@ impl SqlDestructiveChangesChecker<'_> {
             return Ok(());
         }
 
-        let rows_count = self.count_rows_in_table(&table.name).await?;
-
         // Empty tables can be safely migrated.
-        if rows_count == 0 {
-            return Ok(());
-        }
-
-        let typed_unexecutable = sql_unexecutable_migration::SqlUnexecutableMigration::AddedRequiredFieldToTable {
-            column: add_column.column.name.clone(),
-            rows_count: Some(rows_count as u64),
+        let check = DatabaseCheck::TableNotEmpty {
             table: table.name.clone(),
         };
 
-        diagnostics.unexecutable_migrations.push(UnexecutableMigration {
-            description: format!("{}", typed_unexecutable),
-        });
+        let typed_unexecutable = sql_unexecutable_migration::SqlUnexecutableMigration::AddedRequiredFieldToTable {
+            column: add_column.column.name.clone(),
+            table: table.name.clone(),
+        };
+
+        diagnostics.push_unexecutable(typed_unexecutable);
 
         Ok(())
     }
@@ -161,11 +143,11 @@ impl SqlDestructiveChangesChecker<'_> {
     /// Are considered unexecutable:
     ///
     /// - Making an optional column required without a default, when there are existing rows in the table.
-    async fn check_alter_column(
+    fn check_alter_column(
         &self,
         alter_column: &AlterColumn,
         previous_table: &sql_schema_describer::Table,
-        diagnostics: &mut DestructiveChangeDiagnostics,
+        diagnostics: &mut DestructiveCheckPlan,
     ) -> SqlResult<()> {
         let previous_column = previous_table
             .column(&alter_column.name)
@@ -183,30 +165,21 @@ impl SqlDestructiveChangesChecker<'_> {
             return Ok(());
         }
 
-        self.check_for_column_arity_change(&previous_table.name, &differ, diagnostics)
-            .await?;
+        self.check_for_column_arity_change(&previous_table.name, &differ, diagnostics)?;
 
-        let values_count = self.count_values_in_column(&alter_column.name, previous_table).await?;
+        diagnostics.push_warning(SqlMigrationWarning::AlterColumn {
+            table: previous_table.name.clone(),
+            column: alter_column.column.name.clone(),
+        });
 
-        if values_count > 0 {
-            diagnostics.add_warning(MigrationWarning {
-                description: format!(
-                                 "You are about to alter the column `{column_name}` on the `{table_name}` table, which still contains {values_count} non-null values. The data in that column will be lost.",
-                                 column_name=alter_column.name,
-                                 table_name=&previous_table.name,
-                                 values_count=values_count,
-                             )
-            })
-        } else if previous_table.is_part_of_foreign_key(&alter_column.column.name)
+        if previous_table.is_part_of_foreign_key(&alter_column.column.name)
             && alter_column.column.default.is_none()
             && previous_column.default.is_some()
         {
-            diagnostics.add_warning(MigrationWarning {
-                description: format!(
-                    "The migration is about to remove a default value on the foreign key field `{}.{}`.",
-                    previous_table.name, alter_column.name,
-                ),
-            })
+            diagnostics.push_warning(SqlMigrationWarning::ForeignKeyDefaultValueRemoved {
+                table: previous_table.name.clone(),
+                column: alter_column.name.clone(),
+            });
         }
 
         Ok(())
@@ -274,17 +247,14 @@ impl SqlDestructiveChangesChecker<'_> {
         }
     }
 
-    async fn check_for_column_arity_change(
+    fn check_for_column_arity_change(
         &self,
         table_name: &str,
         differ: &crate::sql_schema_differ::ColumnDiffer<'_>,
-        diagnostics: &mut DestructiveChangeDiagnostics,
+        diagnostics: &mut DestructiveCheckPlan,
     ) -> SqlResult<()> {
-        let rows_count = self.count_rows_in_table(table_name).await?;
-
         if !differ.all_changes().arity_changed()
             || !differ.next.tpe.arity.is_required()
-            || rows_count == 0
             || differ.next.default.is_some()
         {
             return Ok(());
@@ -295,9 +265,7 @@ impl SqlDestructiveChangesChecker<'_> {
             column: differ.previous.name.clone(),
         };
 
-        diagnostics.unexecutable_migrations.push(UnexecutableMigration {
-            description: format!("{}", typed_unexecutable),
-        });
+        diagnostics.push_unexecutable(typed_unexecutable);
 
         Ok(())
     }
@@ -307,7 +275,11 @@ impl SqlDestructiveChangesChecker<'_> {
         steps: &[SqlMigrationStep],
         before: &SqlSchema,
     ) -> SqlResult<DestructiveChangeDiagnostics> {
-        let mut diagnostics = DestructiveChangeDiagnostics::new();
+        let mut diagnostics = DestructiveCheckPlan::new();
+
+        // plan from steps
+        // execute plan
+        // render DestructiveChangeDiagnostics
 
         for step in steps {
             match step {
@@ -320,16 +292,13 @@ impl SqlDestructiveChangesChecker<'_> {
                         for change in &alter_table.changes {
                             match *change {
                                 TableChange::DropColumn(ref drop_column) => {
-                                    self.check_column_drop(drop_column, before_table, &mut diagnostics)
-                                        .await?
+                                    self.check_column_drop(drop_column, before_table, &mut diagnostics)?
                                 }
                                 TableChange::AlterColumn(ref alter_column) => {
-                                    self.check_alter_column(alter_column, before_table, &mut diagnostics)
-                                        .await?
+                                    self.check_alter_column(alter_column, before_table, &mut diagnostics)?
                                 }
                                 TableChange::AddColumn(ref add_column) => {
-                                    self.check_add_column(add_column, before_table, &mut diagnostics)
-                                        .await?
+                                    self.check_add_column(add_column, before_table, &mut diagnostics)?
                                 }
                                 _ => (),
                             }
@@ -351,6 +320,8 @@ impl SqlDestructiveChangesChecker<'_> {
                 _ => (),
             }
         }
+
+        let mut diagnostics = diagnostics.execute().await?;
 
         // Temporary, for better reporting.
         diagnostics.warn_about_unexecutable_migrations();
